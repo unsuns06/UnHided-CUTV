@@ -248,6 +248,10 @@ class MP4Decrypter:
             if not include_init and atom.atom_type in init_atoms:
                 continue
 
+            # Skip PSSH boxes as they are not needed in the decrypted output
+            if atom.atom_type == b"pssh":
+                continue
+
             if atom.atom_type in processed_atoms:
                 processed_atom = processed_atoms[atom.atom_type]
                 result.extend(processed_atom.pack())
@@ -278,6 +282,10 @@ class MP4Decrypter:
 
         result = bytearray()
         for atom in atoms:
+            # Skip PSSH boxes as they are not needed in the decrypted output
+            if atom.atom_type == b"pssh":
+                continue
+
             if atom.atom_type in processed_atoms:
                 processed_atom = processed_atoms[atom.atom_type]
                 result.extend(processed_atom.pack())
@@ -349,13 +357,21 @@ class MP4Decrypter:
         # Reset track infos for this moof
         self.track_infos = []
 
-        # First pass: calculate total encryption overhead from all trafs
+        # First pass: total the bytes dropped ahead of mdat, so trun data offsets and the sidx
+        # referenced size stay correct. Every box removed below has to be counted here.
         self.total_encryption_overhead = 0
         for atom in atoms:
-            if atom.atom_type == b"traf":
+            if atom.atom_type == b"pssh":
+                self.total_encryption_overhead += atom.size
+            elif atom.atom_type == b"traf":
                 traf_parser = MP4Parser(atom.data)
                 traf_atoms = traf_parser.list_atoms()
-                traf_overhead = sum(a.size for a in traf_atoms if a.atom_type in {b"senc", b"saiz", b"saio"})
+                traf_overhead = sum(
+                    a.size
+                    for a in traf_atoms
+                    if a.atom_type in {b"senc", b"saiz", b"saio"}
+                    or (a.atom_type in {b"sbgp", b"sgpd"} and self._is_seig_sample_group(a))
+                )
                 self.total_encryption_overhead += traf_overhead
 
         # Second pass: process atoms
@@ -364,7 +380,8 @@ class MP4Decrypter:
             if atom.atom_type == b"traf":
                 new_traf = self._process_traf(atom)
                 new_moof_data.extend(new_traf.pack())
-            else:
+            elif atom.atom_type != b"pssh":
+                # Skip PSSH boxes as they are not needed in the decrypted output
                 new_moof_data.extend(atom.pack())
 
         return MP4Atom(b"moof", len(new_moof_data) + 8, new_moof_data)
@@ -404,6 +421,10 @@ class MP4Decrypter:
             elif atom.atom_type == b"senc":
                 # Parse senc but don't include it in the new decrypted traf data and similarly don't include saiz and saio
                 sample_info = self._parse_senc(atom, sample_count)
+            elif atom.atom_type in {b"sbgp", b"sgpd"} and self._is_seig_sample_group(atom):
+                # The 'seig' sample group describes CENC protection, so it would tell players the
+                # samples are still encrypted and send them looking for IVs that no longer exist
+                continue
             elif atom.atom_type not in {b"saiz", b"saio"}:
                 new_traf_data.extend(atom.pack())
 
@@ -433,6 +454,22 @@ class MP4Decrypter:
             self.current_sample_info = sample_info
 
         return MP4Atom(b"traf", len(new_traf_data) + 8, new_traf_data)
+
+    @staticmethod
+    def _is_seig_sample_group(atom: MP4Atom) -> bool:
+        """
+        Checks whether a 'sbgp'/'sgpd' atom describes the CENC 'seig' sample group.
+
+        Both are full boxes, so the 4 byte grouping type follows the version and flags. Other
+        sample groups, such as 'roll' or 'rap ', are unrelated to encryption and must be kept.
+
+        Args:
+            atom (MP4Atom): The 'sbgp' or 'sgpd' atom to inspect.
+
+        Returns:
+            bool: True if the atom describes the 'seig' sample group.
+        """
+        return len(atom.data) >= 8 and bytes(atom.data[4:8]) == b"seig"
 
     def _parse_tfhd(self, tfhd: MP4Atom) -> None:
         """

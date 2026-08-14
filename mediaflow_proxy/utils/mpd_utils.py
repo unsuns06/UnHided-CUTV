@@ -633,6 +633,26 @@ def generate_vod_segments(profile: dict, duration: int, timescale: int, start_nu
     return [{"number": start_number + i, "duration": duration / timescale} for i in range(segment_count)]
 
 
+def format_program_date_time(start_time: datetime) -> str:
+    """
+    Format a segment start time for EXT-X-PROGRAM-DATE-TIME.
+
+    Segment start times are timezone aware, so ``datetime.isoformat`` already renders a numeric
+    ``+00:00`` UTC offset. Appending a ``Z`` on top of it produces two timezone designators
+    (``1970-01-01T00:00:00+00:00Z``), which strict xs:dateTime parsers such as ExoPlayer's reject,
+    taking the whole playlist down with them. Emit a single designator instead.
+
+    Args:
+        start_time (datetime): Segment start time, aware or naive (naive is assumed to be UTC).
+
+    Returns:
+        str: RFC 3339 timestamp ending in a single 'Z'.
+    """
+    if start_time.tzinfo is None:
+        return start_time.isoformat() + "Z"
+    return start_time.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def create_segment_data(
     segment: Dict, item: dict, profile: dict, mpd_url: str, timescale: Optional[int] = None, base_url: str = ""
 ) -> Dict:
@@ -711,7 +731,7 @@ def create_segment_data(
                 "start_time": segment["start_time"],
                 "end_time": segment["end_time"],
                 "extinf": (segment["end_time"] - segment["start_time"]).total_seconds(),
-                "program_date_time": segment["start_time"].isoformat() + "Z",
+                "program_date_time": format_program_date_time(segment["start_time"]),
             }
         )
     elif "start_time" in segment and "duration" in segment:
@@ -728,7 +748,7 @@ def create_segment_data(
                 "start_time": segment["start_time"],
                 "end_time": segment["start_time"] + timedelta(seconds=duration_seconds),
                 "extinf": duration_seconds,
-                "program_date_time": segment["start_time"].isoformat() + "Z",
+                "program_date_time": format_program_date_time(segment["start_time"]),
             }
         )
     elif "duration" in segment:
